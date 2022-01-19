@@ -7,69 +7,35 @@ import sys
 import threading
 import queue
 import time
+import ctypes
+import inspect
 
-RGB_QUEUE = queue.Queue()
+
 RGB_DEVICE = 'rtsp://admin:a12345678@192.168.1.64/1'
 
 
-# class putStoppableThread(threading.Thread):
-#     def __init__(self, cap):
-#         super(putStoppableThread, self).__init__()
-#         self.daemon = True
-#         self.paused = True # start out paused
-#         self.state = threading.Condition()
-#         self.cap = cap
+class ThreadOperator:
+    @staticmethod
+    def _async_raise(tid, exctype):
+        """raises the exception, performs cleanup if needed"""
+        tid = ctypes.c_long(tid)
+        if not inspect.isclass(exctype):
+            exctype = type(exctype)
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, ctypes.py_object(exctype))
+        if res == 0:
+            raise ValueError("[stop thread error] invalid thread id")
+        elif res != 1:
+            # """if it returns a number greater than one, you're in trouble,
+            # and you should call it again with exc=NULL to revert the effect"""
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(tid, None)
+            raise SystemError("[stop thread error] PyThreadState_SetAsyncExc failed")
 
-#     def run(self):
-#         while True:
-#             with self.state:
-#                 if self.paused:
-#                     self.state.wait()
-#                 RGB_QUEUE.put(self.cap.read()[1])
-#                 RGB_QUEUE.get() if RGB_QUEUE.qsize() > 1 else time.sleep(0.01)
-
-#     def resume(self):
-#         with self.state:
-#             self.paused = False
-#             self.state.notify() # unblock self is waiting
-
-#     def pause(self):
-#         with self.state:
-#             self.paused = True
-
-
-# class getStoppableThread(threading.Thread):
-#     def __init__(self, show_widget):
-#         super(getStoppableThread, self).__init__()
-#         self.daemon = True
-#         self.paused = True # start out paused
-#         self.state = threading.Condition()
-#         self.camera_label = show_widget
-
-#     def run(self):
-#         while True:
-#             with self.state:
-#                 if self.paused:
-#                     self.state.wait()
-#                 self.image = RGB_QUEUE.get()
-#                 self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
-
-#                 # cv2.imshow("123", frame)
-#                 # cv2.waitKey(1)
-#                 if self.image is None or self.image.size == 0:
-#                     continue
-#                 show_image = QtGui.QImage(self.image.data, self.image.shape[1],self.image.shape[0], QtGui.QImage.Format_RGB888)
-#                 self.camera_label.setPixmap(QtGui.QPixmap.fromImage(show_image))
-#                 time.sleep(0.1)  # if update label too frequently will crash
-
-#     def resume(self):
-#         with self.state:
-#             self.paused = False
-#             self.state.notify() # unblock self is waiting
-
-#     def pause(self):
-#         with self.state:
-#             self.paused = True
+    @staticmethod
+    def stop_thread(thread):
+        """
+        kill thread
+        """
+        ThreadOperator._async_raise(thread.ident, SystemExit)
 
 
 class MultiThreadWinPicture(QtWidgets.QWidget):
@@ -79,16 +45,18 @@ class MultiThreadWinPicture(QtWidgets.QWidget):
         """
         super(MultiThreadWinPicture, self).__init__()
         self.device_info = device_info
-        self.cap = cv2.VideoCapture()
+        self.cap = None
         self.set_ui()
-        self.init_process()
-        self.state = threading.Condition()
+        # self.init_process()
+        self.img_queue = queue.Queue()
+        self.img_get_thread = None
+        self.img_put_thread = None
 
-    def init_process(self):
-        self.processes = []
-        self.processes.append(threading.Thread(target=self.image_put))
-        self.processes.append(threading.Thread(target=self.image_get))
-        [process.setDaemon(True) for process in self.processes]   # 主线程退出则退出
+    # def init_process(self):
+    #     self.processes = []
+    #     self.processes.append(threading.Thread(target=self.image_put))
+    #     self.processes.append(threading.Thread(target=self.image_get))
+    #     [process.setDaemon(True) for process in self.processes]   # 主线程退出则退出
 
         # self.processes.append(putStoppableThread(self.cap))
         # self.processes.append(getStoppableThread(self.camera_label))
@@ -97,14 +65,17 @@ class MultiThreadWinPicture(QtWidgets.QWidget):
     
     def image_put(self):
         while True:
-            RGB_QUEUE.put(self.cap.read()[1])
-            RGB_QUEUE.get() if RGB_QUEUE.qsize() > 1 else time.sleep(0.01)
+            self.img_queue.put(self.cap.read()[1])
+            self.img_queue.get() if self.img_queue.qsize() > 1 else time.sleep(0.01)
 
     def image_get(self):
         while True:
-            self.image = RGB_QUEUE.get()
-            self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
-
+            self.image = self.img_queue.get()
+            try:
+                if self.image.data.shape[0]:
+                    self.image = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
+            except Exception as e:
+                continue
             # cv2.imshow("123", frame)
             # cv2.waitKey(1)
             # if self.image is None or self.image.size == 0:
@@ -136,33 +107,45 @@ class MultiThreadWinPicture(QtWidgets.QWidget):
 
   
     def open_camera(self):
-
+        self.cap = cv2.VideoCapture()
         flag = self.cap.open(self.device_info)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         if flag == False:
             msg = QtWidgets.QMessageBox.information(self, "[error]", 
             str(self.device_info) + " camera can not connect!", QtWidgets.QMessageBox.Ok)
         else:
-            [process.start() for process in self.processes]
+            print("[info] thread num: ", len(threading.enumerate()))
+            try:
+                if self.img_put_thread:
+                    ThreadOperator.stop_thread(self.img_put_thread)
+                if self.img_get_thread:
+                    ThreadOperator.stop_thread(self.img_get_thread)
+            except Exception as e:
+                print(e)
+            self.img_put_thread = threading.Thread(target=self.image_put)
+            self.img_get_thread = threading.Thread(target=self.image_get)
+            # self.img_put_thread.setDaemon(True)
+            # self.img_get_thread.setDaemon(True)
+            self.img_put_thread.start()
+            self.img_get_thread.start()
 
 
     def close_camera(self):
-        ...
-        # [process.pause() for process in self.processes]
+        try:
+            if self.img_put_thread:
+                ThreadOperator.stop_thread(self.img_put_thread)
+            if self.img_get_thread:
+                ThreadOperator.stop_thread(self.img_get_thread)
+            self.camera_label.clear()
+        except Exception as e:
+            print(e)
         
-        # self.cap.release()
-        # self.camera_label.clear()
         
-
-
-
-
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     PAC = MultiThreadWinPicture(RGB_DEVICE)
     PAC.showMaximized()
-    PAC.open_camera()
     # time.sleep(10)
     # PAC.close_camera()
     sys.exit(app.exec_())
